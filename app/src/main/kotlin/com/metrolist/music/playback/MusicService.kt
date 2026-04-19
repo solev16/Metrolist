@@ -2180,6 +2180,10 @@ class MusicService :
             val autoplay = runBlocking { dataStore.get(AutoplayKey, true) }
             if (autoplay && player.hasNextMediaItem()) {
                 player.seekToNextMediaItem()
+                player.prepare()
+                if (castConnectionHandler?.isCasting?.value != true) {
+                    player.play()
+                }
             }
         }
 
@@ -2838,7 +2842,11 @@ class MusicService :
      * Handles final failure when all recovery attempts have been exhausted.
      */
     private fun handleFinalFailure() {
-        if (dataStore.get(AutoSkipNextOnErrorKey, false)) {
+        val autoSkipOnError = dataStore.get(AutoSkipNextOnErrorKey, false)
+        val autoplay = dataStore.get(AutoplayKey, true)
+        val canAdvance = player.hasNextMediaItem()
+
+        if (autoSkipOnError || (autoplay && canAdvance)) {
             Timber.tag(TAG).d("All recovery attempts exhausted, auto-skipping to next track")
             skipOnError()
         } else {
@@ -3309,6 +3317,15 @@ class MusicService :
             notification = latestMediaNotification ?: createFallbackForegroundNotification(),
             deniedMessage = "Foreground promotion denied during notification update; stopping service",
             failureMessage = "Failed to promote service during notification update; stopping service",
+            stopOnFailure = true,
+        )
+
+    private fun tryEnsureForegroundWithLatestNotification(): Boolean =
+        startForegroundSafely(
+            notification = latestMediaNotification ?: createFallbackForegroundNotification(),
+            deniedMessage = "Foreground promotion denied during notification update",
+            failureMessage = "Failed to promote service during notification update",
+            stopOnFailure = false,
         )
 
     private fun ensureForegroundChannelExists() {
@@ -3345,6 +3362,7 @@ class MusicService :
         notification: Notification,
         deniedMessage: String,
         failureMessage: String,
+        stopOnFailure: Boolean = true,
     ): Boolean =
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -3359,12 +3377,16 @@ class MusicService :
             true
         } catch (e: ForegroundServiceStartNotAllowedException) {
             Timber.tag(TAG).w(e, deniedMessage)
-            stopSelf()
+            if (stopOnFailure) {
+                stopSelf()
+            }
             false
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, failureMessage)
             reportException(e)
-            stopSelf()
+            if (stopOnFailure) {
+                stopSelf()
+            }
             false
         }
 
@@ -3459,15 +3481,16 @@ class MusicService :
         startInForegroundRequired: Boolean,
     ) {
         try {
-            // Media3 1.7.x promotes with ContextCompat.startForegroundService() from an async
-            // callback, which can throw ForegroundServiceStartNotAllowedException on newer
-            // Android versions outside MediaSessionService's internal try/catch path.
-            // Always request a background-safe notification update and promote manually with
-            // startForeground() so we can fail gracefully instead of crashing the process.
-            super.onUpdateNotification(session, false)
-            if (startInForegroundRequired) {
-                ensureForegroundWithLatestNotificationOrStop()
-            }
+            // Pass startInForegroundRequired through unchanged so Media3 manages the
+            // foreground service lifecycle itself. Overriding it to `false` and promoting
+            // manually causes Media3 to demote the service on every notification update
+            // (track change, metadata refresh, etc.); the subsequent manual re-promotion is
+            // denied while backgrounded on Android 12+ (mAllowStartForeground=false), which
+            // ends background playback mid-song after autoplay transitions.
+            // Media3 1.10.0 catches ForegroundServiceStartNotAllowedException internally in
+            // onUpdateNotificationInternal, so the 1.7.x crash-workaround is no longer
+            // needed; the try/catch below is kept as belt-and-suspenders defense.
+            super.onUpdateNotification(session, startInForegroundRequired)
         } catch (e: ForegroundServiceStartNotAllowedException) {
             handleForegroundServiceStartNotAllowed(e)
         } catch (e: IllegalStateException) {
@@ -3619,6 +3642,21 @@ class MusicService :
         } else {
             Timber.tag(TAG).w("Foreground service start denied by MediaSessionService listener")
         }
+
+        if (tryEnsureForegroundWithLatestNotification()) {
+            return
+        }
+
+        if (!::player.isInitialized) {
+            stopSelf()
+            return
+        }
+
+        if (player.isPlaying) {
+            Timber.tag(TAG).w("Keeping playback alive after denied foreground restart request")
+            return
+        }
+
         runCatching {
             pauseAllPlayersAndStopSelf()
         }.onFailure {
