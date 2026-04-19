@@ -9,8 +9,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
-import android.os.Build
 import androidx.core.graphics.createBitmap
+import androidx.core.net.toUri
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.util.BitmapLoader
 import coil3.imageLoader
@@ -19,7 +19,6 @@ import coil3.request.ImageRequest
 import coil3.request.SuccessResult
 import coil3.request.allowHardware
 import coil3.toBitmap
-import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,20 +55,8 @@ class CoilBitmapLoader(
             }
         }
 
-    private fun shouldSkipNetworkArtwork(uri: Uri): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
-        return when (uri.scheme?.lowercase()) {
-            "http", "https" -> true
-            else -> false
-        }
-    }
-
-    override fun loadBitmap(uri: Uri): ListenableFuture<Bitmap> {
-        if (shouldSkipNetworkArtwork(uri)) {
-            return Futures.immediateFuture(createFallbackBitmap())
-        }
-
-        return scope.future(Dispatchers.IO) {
+    override fun loadBitmap(uri: Uri): ListenableFuture<Bitmap> =
+        scope.future(Dispatchers.IO) {
             try {
                 val request =
                     ImageRequest
@@ -98,11 +85,10 @@ class CoilBitmapLoader(
                 createFallbackBitmap()
             }
         }
-    }
 
     override fun loadBitmapFromMetadata(metadata: MediaMetadata): ListenableFuture<Bitmap>? {
         metadata.artworkData?.let { return decodeBitmap(it) }
-        val artworkUri = metadata.artworkUri ?: return null
+        val artworkUri = metadata.artworkUri ?: metadata.extras?.getString("artwork_uri")?.toUri() ?: return null
         return loadBitmap(artworkUri)
     }
 }
